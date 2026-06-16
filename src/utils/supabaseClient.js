@@ -159,13 +159,15 @@ export const deleteMeter = async (id) => {
 };
 
 // Meter Readings
-export const addMeterReading = async (meterId, readingDate, readingValue, photoPath, extractedByOcr) => {
+export const addMeterReading = async (meterId, readingDate, readingValue, photoPath, extractedByOcr, readingDay, readingNight) => {
   const { data, error } = await supabase
     .from('meter_readings')
     .upsert([{
       meter_id: meterId,
       reading_date: readingDate,
       reading_value: readingValue,
+      reading_day: readingDay ?? null,
+      reading_night: readingNight ?? null,
       photo_file_path: photoPath,
       extracted_by_ocr: extractedByOcr || false
     }], { onConflict: 'meter_id' })
