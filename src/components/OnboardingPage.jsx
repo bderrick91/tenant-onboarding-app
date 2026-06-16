@@ -230,8 +230,8 @@ function OnboardingPage({ onboarding: initialOnboarding, onBack, user }) {
       const filename = `${onboarding.id}/${meterId}/${Date.now()}_meter.jpg`;
       await uploadFile(file, 'onboarding-files', filename);
 
-      // Save reading
-      const { error } = await addMeterReading(meterId, today, newReading, filename, true);
+      // Save reading (OCR fills total only; day/night entered manually if applicable)
+      const { error } = await addMeterReading(meterId, today, newReading, filename, true, null, null);
       if (!error) {
         setMeterReadings({
           ...meterReadings,
@@ -244,7 +244,7 @@ function OnboardingPage({ onboarding: initialOnboarding, onBack, user }) {
     }
   };
 
-  const handleSaveReading = async (meterId, readingValue) => {
+  const handleSaveReading = async (meterId, readingValue, readingDay, readingNight) => {
     if (!readingValue) {
       showMessage('error', 'Enter a reading value');
       return;
@@ -252,13 +252,21 @@ function OnboardingPage({ onboarding: initialOnboarding, onBack, user }) {
 
     const today = new Date().toISOString().split('T')[0];
     setSaving(true);
-    const { error } = await addMeterReading(meterId, today, parseFloat(readingValue), null, false);
+    const { error } = await addMeterReading(
+      meterId,
+      today,
+      parseFloat(readingValue),
+      null,
+      false,
+      readingDay !== undefined && readingDay !== '' ? parseFloat(readingDay) : null,
+      readingNight !== undefined && readingNight !== '' ? parseFloat(readingNight) : null
+    );
     setSaving(false);
 
     if (!error) {
       setMeterReadings({
         ...meterReadings,
-        [meterId]: { meter_id: meterId, reading_date: today, reading_value: parseFloat(readingValue) }
+        [meterId]: { meter_id: meterId, reading_date: today, reading_value: parseFloat(readingValue), reading_day: readingDay, reading_night: readingNight }
       });
       showMessage('success', 'Reading saved');
     }
@@ -590,6 +598,26 @@ function ComplianceSection({ complianceDocs, docType, setDocType, docDate, setDo
 function UtilitiesSection({ meters, newMeter, setNewMeter, onAddMeter, onDeleteMeter, meterReadings, onPhotoUpload, onSaveReading, onEmailUtilities, saving }) {
   const [readingInputs, setReadingInputs] = useState({});
 
+  const updateReadingInput = (meterId, field, value) => {
+    const current = readingInputs[meterId] || {};
+    const updated = { ...current, [field]: value };
+
+    // Auto-calculate total when day or night changes, unless user has manually edited total
+    if ((field === 'day' || field === 'night') && !updated.totalManuallyEdited) {
+      const day = parseFloat(updated.day) || 0;
+      const night = parseFloat(updated.night) || 0;
+      updated.total = (day || night) ? (day + night).toString() : '';
+    }
+
+    if (field === 'total') {
+      updated.totalManuallyEdited = true;
+    }
+
+    setReadingInputs({ ...readingInputs, [meterId]: updated });
+  };
+
+  const unitFor = (meterType) => meterType === 'electricity' ? 'kWh' : 'm³';
+
   return (
     <div className="section">
       <h3>Utilities & Meters</h3>
@@ -629,6 +657,10 @@ function UtilitiesSection({ meters, newMeter, setNewMeter, onAddMeter, onDeleteM
         <div className="meters-list">
           {meters.map(meter => {
             const reading = meterReadings[meter.id];
+            const inputs = readingInputs[meter.id] || {};
+            const isElectricity = meter.meter_type === 'electricity';
+            const unit = unitFor(meter.meter_type);
+
             return (
               <div key={meter.id} className="meter-item card">
                 <div className="meter-header">
@@ -643,17 +675,55 @@ function UtilitiesSection({ meters, newMeter, setNewMeter, onAddMeter, onDeleteM
                     <input type="file" accept="image/*" onChange={(e) => onPhotoUpload(meter.id, e.target.files?.[0])} />
                   </div>
 
-                  <div className="form-group">
-                    <label>Reading Value {reading ? `(${reading.reading_date})` : ''}</label>
-                    <input
-                      type="number"
-                      step="0.01"
-                      value={readingInputs[meter.id] || reading?.reading_value || ''}
-                      onChange={(e) => setReadingInputs({ ...readingInputs, [meter.id]: e.target.value })}
-                      placeholder="Enter meter reading"
-                    />
-                    <button className="btn btn-primary btn-sm" onClick={() => onSaveReading(meter.id, readingInputs[meter.id] || '')} disabled={saving}>Save Reading</button>
-                  </div>
+                  {isElectricity && meter.day_night_flag ? (
+                    <>
+                      <div className="form-row">
+                        <div className="form-group">
+                          <label>Day Reading (kWh)</label>
+                          <input
+                            type="number"
+                            step="0.01"
+                            value={inputs.day ?? ''}
+                            onChange={(e) => updateReadingInput(meter.id, 'day', e.target.value)}
+                            placeholder="Day reading"
+                          />
+                        </div>
+                        <div className="form-group">
+                          <label>Night Reading (kWh)</label>
+                          <input
+                            type="number"
+                            step="0.01"
+                            value={inputs.night ?? ''}
+                            onChange={(e) => updateReadingInput(meter.id, 'night', e.target.value)}
+                            placeholder="Night reading"
+                          />
+                        </div>
+                      </div>
+                      <div className="form-group">
+                        <label>Total Reading (kWh) {reading ? `— last saved ${reading.reading_date}` : ''}</label>
+                        <input
+                          type="number"
+                          step="0.01"
+                          value={inputs.total ?? reading?.reading_value ?? ''}
+                          onChange={(e) => updateReadingInput(meter.id, 'total', e.target.value)}
+                          placeholder="Auto-calculated from day + night, editable"
+                        />
+                      </div>
+                      <button className="btn btn-primary btn-sm" onClick={() => onSaveReading(meter.id, inputs.total || '', inputs.day, inputs.night)} disabled={saving}>Save Reading</button>
+                    </>
+                  ) : (
+                    <div className="form-group">
+                      <label>Reading ({unit}) {reading ? `— last saved ${reading.reading_date}` : ''}</label>
+                      <input
+                        type="number"
+                        step="0.01"
+                        value={inputs.total ?? reading?.reading_value ?? ''}
+                        onChange={(e) => updateReadingInput(meter.id, 'total', e.target.value)}
+                        placeholder={`Enter reading in ${unit}`}
+                      />
+                      <button className="btn btn-primary btn-sm" onClick={() => onSaveReading(meter.id, inputs.total || '')} disabled={saving}>Save Reading</button>
+                    </div>
+                  )}
                 </div>
               </div>
             );
@@ -667,34 +737,46 @@ function UtilitiesSection({ meters, newMeter, setNewMeter, onAddMeter, onDeleteM
 }
 
 function SignageSection({ signageData, setSignageData, onSave, saving }) {
+  const toSelectValue = (val) => val === true ? 'yes' : val === false ? 'no' : 'na';
+  const fromSelectValue = (val) => val === 'yes' ? true : val === 'no' ? false : null;
+
   return (
     <div className="section">
       <h3>Signage Updated</h3>
-      <div className="checkbox-group">
-        <label>
-          <input
-            type="checkbox"
-            checked={signageData.directories_updated === true}
-            onChange={(e) => setSignageData({ ...signageData, directories_updated: e.target.checked ? true : null })}
-          />
-          Directories Updated
-        </label>
-        <label>
-          <input
-            type="checkbox"
-            checked={signageData.postbox_labels_updated === true}
-            onChange={(e) => setSignageData({ ...signageData, postbox_labels_updated: e.target.checked ? true : null })}
-          />
-          Postbox Labels Updated
-        </label>
-        <label>
-          <input
-            type="checkbox"
-            checked={signageData.parking_labels_updated === true}
-            onChange={(e) => setSignageData({ ...signageData, parking_labels_updated: e.target.checked ? true : null })}
-          />
-          Parking Labels Updated
-        </label>
+      <div className="form-row">
+        <div className="form-group">
+          <label>Directories Updated</label>
+          <select
+            value={toSelectValue(signageData.directories_updated)}
+            onChange={(e) => setSignageData({ ...signageData, directories_updated: fromSelectValue(e.target.value) })}
+          >
+            <option value="na">N/A</option>
+            <option value="yes">Yes</option>
+            <option value="no">No</option>
+          </select>
+        </div>
+        <div className="form-group">
+          <label>Postbox Labels Updated</label>
+          <select
+            value={toSelectValue(signageData.postbox_labels_updated)}
+            onChange={(e) => setSignageData({ ...signageData, postbox_labels_updated: fromSelectValue(e.target.value) })}
+          >
+            <option value="na">N/A</option>
+            <option value="yes">Yes</option>
+            <option value="no">No</option>
+          </select>
+        </div>
+        <div className="form-group">
+          <label>Parking Labels Updated</label>
+          <select
+            value={toSelectValue(signageData.parking_labels_updated)}
+            onChange={(e) => setSignageData({ ...signageData, parking_labels_updated: fromSelectValue(e.target.value) })}
+          >
+            <option value="na">N/A</option>
+            <option value="yes">Yes</option>
+            <option value="no">No</option>
+          </select>
+        </div>
       </div>
       <div className="form-group">
         <label>Other Signage Requirements</label>
