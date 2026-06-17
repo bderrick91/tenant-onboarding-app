@@ -15,13 +15,39 @@ import {
   addTenantContact,
   deleteTenantContact,
   uploadFile,
-  deleteFile,
-  getFileUrl
+  deleteFile
 } from '../utils/supabaseClient';
 import { extractMeterReading } from '../utils/ocrService';
 import { sendComplianceDocumentsEmail, sendUtilitiesInfoEmail, sendContactInfoRequestEmail } from '../utils/emailService';
 import { generateSimpleOnboardingPDF } from '../utils/pdfService';
-import { ChevronLeft, Upload, Plus, Trash2, Send, Download, AlertCircle, CheckCircle, Clock } from 'lucide-react';
+import { ChevronLeft, Plus, Trash2, Send, Download, AlertCircle, CheckCircle, Clock } from 'lucide-react';
+
+// Shared progress logic — also used by DashboardPage for the record list view.
+// Returns an array of { key, label, na, complete } for the 5 trackable sections.
+export function calculateSectionStatus({ handoverData, complianceNA, complianceDocs, meters, meterReadings, signageData, contacts }) {
+  const handoverComplete = !!(handoverData && handoverData.handover_date);
+
+  const complianceComplete = complianceNA || (complianceDocs && complianceDocs.length > 0);
+
+  const meterList = meters || [];
+  const readingsMap = meterReadings || {};
+  const utilitiesComplete = meterList.length > 0 && meterList.every(m => !!readingsMap[m.id]);
+
+  const signageFields = ['directories_updated', 'postbox_labels_updated', 'parking_labels_updated'];
+  const signageAllResolved = signageData
+    ? signageFields.every(f => signageData[f] === true || signageData[f] === null || signageData[f] === undefined)
+    : false;
+
+  const contactsComplete = (contacts || []).some(c => c.contact_type === 'principal');
+
+  return [
+    { key: 'handover', label: 'Handover', na: false, complete: handoverComplete },
+    { key: 'compliance', label: 'Compliance', na: complianceNA, complete: complianceComplete },
+    { key: 'utilities', label: 'Utilities', na: false, complete: utilitiesComplete },
+    { key: 'signage', label: 'Signage', na: false, complete: signageAllResolved },
+    { key: 'contacts', label: 'Contacts', na: false, complete: contactsComplete }
+  ];
+}
 
 function OnboardingPage({ onboarding: initialOnboarding, onBack, user }) {
   const [onboarding, setOnboarding] = useState(initialOnboarding);
@@ -33,7 +59,7 @@ function OnboardingPage({ onboarding: initialOnboarding, onBack, user }) {
   const [handoverData, setHandoverData] = useState(
     onboarding.handover_details ? { ...onboarding.handover_details } : {
       handover_date: '',
-      keys_handed: 'na',
+      keys_handed: '',
       codes_handed: '',
       access_restricted_to_tenant_only: false,
       gate_access_granted: false
@@ -46,12 +72,12 @@ function OnboardingPage({ onboarding: initialOnboarding, onBack, user }) {
   const [docNotes, setDocNotes] = useState('');
   const [docFile, setDocFile] = useState(null);
   const [complianceDocs, setComplianceDocs] = useState(onboarding.compliance_documents || []);
+  const [complianceNA, setComplianceNA] = useState(onboarding.compliance_na || false);
 
   // Meters state
   const [meters, setMeters] = useState(onboarding.meters || []);
   const [newMeter, setNewMeter] = useState({
     meter_type: 'electricity',
-    meter_number: '',
     supply_ref: '',
     meter_serial_nr: '',
     day_night_flag: false
@@ -174,8 +200,8 @@ function OnboardingPage({ onboarding: initialOnboarding, onBack, user }) {
 
   // Meter handlers
   const handleAddMeter = async () => {
-    if (!newMeter.meter_number || !newMeter.meter_type) {
-      showMessage('error', 'Meter type and number required');
+    if (!newMeter.supply_ref && !newMeter.meter_serial_nr) {
+      showMessage('error', 'Supply Reference or Meter Serial Number required');
       return;
     }
 
@@ -183,7 +209,7 @@ function OnboardingPage({ onboarding: initialOnboarding, onBack, user }) {
     const { data, error } = await addMeter(
       onboarding.id,
       newMeter.meter_type,
-      newMeter.meter_number,
+      newMeter.meter_serial_nr || newMeter.supply_ref,
       newMeter.supply_ref,
       newMeter.meter_serial_nr,
       newMeter.day_night_flag
@@ -196,7 +222,6 @@ function OnboardingPage({ onboarding: initialOnboarding, onBack, user }) {
       setMeters([...meters, data[0]]);
       setNewMeter({
         meter_type: 'electricity',
-        meter_number: '',
         supply_ref: '',
         meter_serial_nr: '',
         day_night_flag: false
@@ -421,6 +446,19 @@ function OnboardingPage({ onboarding: initialOnboarding, onBack, user }) {
     }
   };
 
+  // Compliance N/A toggle
+  const handleToggleComplianceNA = async (checked) => {
+    setComplianceNA(checked);
+    setSaving(true);
+    const { error } = await updateOnboarding(onboarding.id, { compliance_na: checked });
+    setSaving(false);
+    if (error) {
+      showMessage('error', 'Failed to update compliance status');
+    } else {
+      showMessage('success', checked ? 'Compliance marked N/A' : 'Compliance re-enabled');
+    }
+  };
+
   // PDF export
   const handleExportPDF = () => {
     const result = generateSimpleOnboardingPDF(onboarding);
@@ -431,9 +469,20 @@ function OnboardingPage({ onboarding: initialOnboarding, onBack, user }) {
     }
   };
 
-  const progressPercentage = workflowSteps.length > 0
-    ? Math.round((workflowSteps.filter(s => s.is_complete).length / workflowSteps.length) * 100)
-    : 0;
+  // Real cross-tab progress: 5 sections, each either N/A or scored complete/incomplete
+  const sectionStatus = calculateSectionStatus({
+    handoverData,
+    complianceNA,
+    complianceDocs,
+    meters,
+    meterReadings,
+    signageData,
+    contacts
+  });
+  const applicableSections = sectionStatus.filter(s => !s.na);
+  const progressPercentage = applicableSections.length > 0
+    ? Math.round((applicableSections.filter(s => s.complete).length / applicableSections.length) * 100)
+    : 100;
 
   return (
     <div className="onboarding-page">
@@ -455,6 +504,13 @@ function OnboardingPage({ onboarding: initialOnboarding, onBack, user }) {
           <div className="progress-fill" style={{ width: `${progressPercentage}%` }}></div>
         </div>
         <p className="progress-text">{progressPercentage}% Complete</p>
+        <div className="progress-breakdown">
+          {sectionStatus.map(s => (
+            <span key={s.key} className={`progress-chip ${s.na ? 'chip-na' : s.complete ? 'chip-done' : 'chip-pending'}`}>
+              {s.label}{s.na ? ' (N/A)' : s.complete ? ' ✓' : ''}
+            </span>
+          ))}
+        </div>
       </div>
 
       {message.text && (
@@ -507,7 +563,7 @@ function OnboardingPage({ onboarding: initialOnboarding, onBack, user }) {
 
       <div className="tab-content">
         {activeTab === 'handover' && <HandoverSection handoverData={handoverData} setHandoverData={setHandoverData} onSave={handleSaveHandover} saving={saving} />}
-        {activeTab === 'compliance' && <ComplianceSection complianceDocs={complianceDocs} docType={docType} setDocType={setDocType} docDate={docDate} setDocDate={setDocDate} docNotes={docNotes} setDocNotes={setDocNotes} docFile={docFile} setDocFile={setDocFile} onAdd={handleAddCompliance} onDelete={handleDeleteCompliance} saving={saving} />}
+        {activeTab === 'compliance' && <ComplianceSection complianceDocs={complianceDocs} docType={docType} setDocType={setDocType} docDate={docDate} setDocDate={setDocDate} docNotes={docNotes} setDocNotes={setDocNotes} docFile={docFile} setDocFile={setDocFile} onAdd={handleAddCompliance} onDelete={handleDeleteCompliance} saving={saving} complianceNA={complianceNA} onToggleNA={handleToggleComplianceNA} />}
         {activeTab === 'utilities' && <UtilitiesSection meters={meters} newMeter={newMeter} setNewMeter={setNewMeter} onAddMeter={handleAddMeter} onDeleteMeter={handleDeleteMeter} meterReadings={meterReadings} onPhotoUpload={handleMeterPhotoUpload} onSaveReading={handleSaveReading} onEmailUtilities={handleEmailUtilities} saving={saving} />}
         {activeTab === 'signage' && <SignageSection signageData={signageData} setSignageData={setSignageData} onSave={async () => { setSaving(true); await updateSignage(onboarding.id, signageData); setSaving(false); showMessage('success', 'Signage saved'); }} saving={saving} />}
         {activeTab === 'workflow' && <WorkflowSection workflowSteps={workflowSteps} customSteps={customSteps} newCustomStep={newCustomStep} setNewCustomStep={setNewCustomStep} onToggleWorkflow={handleToggleWorkflow} onAddCustomStep={handleAddCustomStep} onDeleteCustomStep={handleDeleteCustomStep} saving={saving} />}
@@ -529,11 +585,7 @@ function HandoverSection({ handoverData, setHandoverData, onSave, saving }) {
         </div>
         <div className="form-group">
           <label>Keys Handed Over</label>
-          <select value={handoverData.keys_handed || 'na'} onChange={(e) => setHandoverData({ ...handoverData, keys_handed: e.target.value })}>
-            <option value="na">N/A</option>
-            <option value="yes">Yes</option>
-            <option value="no">No</option>
-          </select>
+          <input type="text" placeholder="e.g., 2 sets handed over, 1 retained" value={handoverData.keys_handed || ''} onChange={(e) => setHandoverData({ ...handoverData, keys_handed: e.target.value })} />
         </div>
       </div>
       <div className="form-row">
@@ -545,7 +597,7 @@ function HandoverSection({ handoverData, setHandoverData, onSave, saving }) {
       <div className="checkbox-group">
         <label>
           <input type="checkbox" checked={handoverData.access_restricted_to_tenant_only || false} onChange={(e) => setHandoverData({ ...handoverData, access_restricted_to_tenant_only: e.target.checked })} />
-          Access Restricted to Tenant Only
+          Access Control: Restricted to Tenant Only
         </label>
         <label>
           <input type="checkbox" checked={handoverData.gate_access_granted || false} onChange={(e) => setHandoverData({ ...handoverData, gate_access_granted: e.target.checked })} />
@@ -557,39 +609,50 @@ function HandoverSection({ handoverData, setHandoverData, onSave, saving }) {
   );
 }
 
-function ComplianceSection({ complianceDocs, docType, setDocType, docDate, setDocDate, docNotes, setDocNotes, docFile, setDocFile, onAdd, onDelete, saving }) {
+function ComplianceSection({ complianceDocs, docType, setDocType, docDate, setDocDate, docNotes, setDocNotes, docFile, setDocFile, onAdd, onDelete, saving, complianceNA, onToggleNA }) {
   return (
     <div className="section">
       <h3>Compliance Documents</h3>
-      <div className="form-row">
-        <div className="form-group">
-          <label>Document Type</label>
-          <input type="text" placeholder="e.g., EICR, Gas Certificate, Air-Con Service" value={docType} onChange={(e) => setDocType(e.target.value)} />
-        </div>
-        <div className="form-group">
-          <label>Date</label>
-          <input type="date" value={docDate} onChange={(e) => setDocDate(e.target.value)} />
-        </div>
+      <div className="checkbox-group" style={{ marginBottom: 'var(--spacing-md)' }}>
+        <label>
+          <input type="checkbox" checked={complianceNA} onChange={(e) => onToggleNA(e.target.checked)} />
+          Not Applicable for this Onboarding
+        </label>
       </div>
-      <div className="form-group">
-        <label>Notes</label>
-        <textarea placeholder="Optional notes" value={docNotes} onChange={(e) => setDocNotes(e.target.value)} rows="2"></textarea>
-      </div>
-      <div className="form-group">
-        <label>Upload Document (optional)</label>
-        <input type="file" onChange={(e) => setDocFile(e.target.files?.[0])} />
-      </div>
-      <button className="btn btn-primary" onClick={onAdd} disabled={saving}><Plus size={16} /> Add Document</button>
 
-      {complianceDocs.length > 0 && (
-        <div className="documents-list">
-          {complianceDocs.map(doc => (
-            <div key={doc.id} className="doc-item">
-              <span>{doc.doc_type} ({doc.document_date})</span>
-              <button className="btn btn-danger btn-sm" onClick={() => onDelete(doc.id)} disabled={saving}><Trash2 size={14} /></button>
+      {!complianceNA && (
+        <>
+          <div className="form-row">
+            <div className="form-group">
+              <label>Document Type</label>
+              <input type="text" placeholder="e.g., EICR, Gas Certificate, Air-Con Service" value={docType} onChange={(e) => setDocType(e.target.value)} />
             </div>
-          ))}
-        </div>
+            <div className="form-group">
+              <label>Date</label>
+              <input type="date" value={docDate} onChange={(e) => setDocDate(e.target.value)} />
+            </div>
+          </div>
+          <div className="form-group">
+            <label>Notes</label>
+            <textarea placeholder="Optional notes" value={docNotes} onChange={(e) => setDocNotes(e.target.value)} rows="2"></textarea>
+          </div>
+          <div className="form-group">
+            <label>Upload Document (optional)</label>
+            <input type="file" onChange={(e) => setDocFile(e.target.files?.[0])} />
+          </div>
+          <button className="btn btn-primary" onClick={onAdd} disabled={saving}><Plus size={16} /> Add Document</button>
+
+          {complianceDocs.length > 0 && (
+            <div className="documents-list">
+              {complianceDocs.map(doc => (
+                <div key={doc.id} className="doc-item">
+                  <span>{doc.doc_type} ({doc.document_date})</span>
+                  <button className="btn btn-danger btn-sm" onClick={() => onDelete(doc.id)} disabled={saving}><Trash2 size={14} /></button>
+                </div>
+              ))}
+            </div>
+          )}
+        </>
       )}
     </div>
   );
@@ -631,15 +694,11 @@ function UtilitiesSection({ meters, newMeter, setNewMeter, onAddMeter, onDeleteM
           </select>
         </div>
         <div className="form-group">
-          <label>Meter Number</label>
-          <input type="text" placeholder="e.g., 123456789" value={newMeter.meter_number} onChange={(e) => setNewMeter({ ...newMeter, meter_number: e.target.value })} />
-        </div>
-      </div>
-      <div className="form-row">
-        <div className="form-group">
           <label>Supply Reference</label>
           <input type="text" value={newMeter.supply_ref} onChange={(e) => setNewMeter({ ...newMeter, supply_ref: e.target.value })} />
         </div>
+      </div>
+      <div className="form-row">
         <div className="form-group">
           <label>Meter Serial Number</label>
           <input type="text" value={newMeter.meter_serial_nr} onChange={(e) => setNewMeter({ ...newMeter, meter_serial_nr: e.target.value })} />
@@ -659,12 +718,13 @@ function UtilitiesSection({ meters, newMeter, setNewMeter, onAddMeter, onDeleteM
             const reading = meterReadings[meter.id];
             const inputs = readingInputs[meter.id] || {};
             const isElectricity = meter.meter_type === 'electricity';
+            const showDayNight = isElectricity && meter.day_night_flag;
             const unit = unitFor(meter.meter_type);
 
             return (
               <div key={meter.id} className="meter-item card">
                 <div className="meter-header">
-                  <h4>{meter.meter_type.toUpperCase()} - {meter.meter_number}</h4>
+                  <h4>{meter.meter_type.toUpperCase()} {meter.meter_serial_nr ? `- ${meter.meter_serial_nr}` : ''}</h4>
                   <button className="btn btn-danger btn-sm" onClick={() => onDeleteMeter(meter.id)} disabled={saving}><Trash2 size={14} /></button>
                 </div>
                 <p><small>{meter.supply_ref && `Supply Ref: ${meter.supply_ref}`}</small></p>
@@ -675,55 +735,42 @@ function UtilitiesSection({ meters, newMeter, setNewMeter, onAddMeter, onDeleteM
                     <input type="file" accept="image/*" onChange={(e) => onPhotoUpload(meter.id, e.target.files?.[0])} />
                   </div>
 
-                  {isElectricity && meter.day_night_flag ? (
-                    <>
-                      <div className="form-row">
-                        <div className="form-group">
-                          <label>Day Reading (kWh)</label>
-                          <input
-                            type="number"
-                            step="0.01"
-                            value={inputs.day ?? ''}
-                            onChange={(e) => updateReadingInput(meter.id, 'day', e.target.value)}
-                            placeholder="Day reading"
-                          />
-                        </div>
-                        <div className="form-group">
-                          <label>Night Reading (kWh)</label>
-                          <input
-                            type="number"
-                            step="0.01"
-                            value={inputs.night ?? ''}
-                            onChange={(e) => updateReadingInput(meter.id, 'night', e.target.value)}
-                            placeholder="Night reading"
-                          />
-                        </div>
-                      </div>
+                  {showDayNight && (
+                    <div className="form-row">
                       <div className="form-group">
-                        <label>Total Reading (kWh) {reading ? `— last saved ${reading.reading_date}` : ''}</label>
+                        <label>Day Reading (kWh)</label>
                         <input
                           type="number"
                           step="0.01"
-                          value={inputs.total ?? reading?.reading_value ?? ''}
-                          onChange={(e) => updateReadingInput(meter.id, 'total', e.target.value)}
-                          placeholder="Auto-calculated from day + night, editable"
+                          value={inputs.day ?? ''}
+                          onChange={(e) => updateReadingInput(meter.id, 'day', e.target.value)}
+                          placeholder="Day reading"
                         />
                       </div>
-                      <button className="btn btn-primary btn-sm" onClick={() => onSaveReading(meter.id, inputs.total || '', inputs.day, inputs.night)} disabled={saving}>Save Reading</button>
-                    </>
-                  ) : (
-                    <div className="form-group">
-                      <label>Reading ({unit}) {reading ? `— last saved ${reading.reading_date}` : ''}</label>
-                      <input
-                        type="number"
-                        step="0.01"
-                        value={inputs.total ?? reading?.reading_value ?? ''}
-                        onChange={(e) => updateReadingInput(meter.id, 'total', e.target.value)}
-                        placeholder={`Enter reading in ${unit}`}
-                      />
-                      <button className="btn btn-primary btn-sm" onClick={() => onSaveReading(meter.id, inputs.total || '')} disabled={saving}>Save Reading</button>
+                      <div className="form-group">
+                        <label>Night Reading (kWh)</label>
+                        <input
+                          type="number"
+                          step="0.01"
+                          value={inputs.night ?? ''}
+                          onChange={(e) => updateReadingInput(meter.id, 'night', e.target.value)}
+                          placeholder="Night reading"
+                        />
+                      </div>
                     </div>
                   )}
+
+                  <div className="form-group">
+                    <label>Total Reading ({unit}) {reading ? `— last saved ${reading.reading_date}` : ''}</label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={inputs.total ?? reading?.reading_value ?? ''}
+                      onChange={(e) => updateReadingInput(meter.id, 'total', e.target.value)}
+                      placeholder={showDayNight ? 'Auto-calculated from day + night, editable' : `Enter reading in ${unit}`}
+                    />
+                  </div>
+                  <button className="btn btn-primary btn-sm" onClick={() => onSaveReading(meter.id, inputs.total || '', inputs.day, inputs.night)} disabled={saving}>Save Reading</button>
                 </div>
               </div>
             );
@@ -737,46 +784,41 @@ function UtilitiesSection({ meters, newMeter, setNewMeter, onAddMeter, onDeleteM
 }
 
 function SignageSection({ signageData, setSignageData, onSave, saving }) {
-  const toSelectValue = (val) => val === true ? 'yes' : val === false ? 'no' : 'na';
-  const fromSelectValue = (val) => val === 'yes' ? true : val === 'no' ? false : null;
+  // Three-state per item: null = N/A, true = Done, false = Not done yet
+  const renderSignageRow = (label, field) => {
+    const value = signageData[field];
+    const isNA = value === null || value === undefined;
+
+    return (
+      <div className="signage-row" key={field}>
+        <label className="signage-row-main">
+          <input
+            type="checkbox"
+            checked={value === true}
+            disabled={isNA}
+            onChange={(e) => setSignageData({ ...signageData, [field]: e.target.checked })}
+          />
+          {label}
+        </label>
+        <label className="signage-row-na">
+          <input
+            type="checkbox"
+            checked={isNA}
+            onChange={(e) => setSignageData({ ...signageData, [field]: e.target.checked ? null : false })}
+          />
+          N/A
+        </label>
+      </div>
+    );
+  };
 
   return (
     <div className="section">
       <h3>Signage Updated</h3>
-      <div className="form-row">
-        <div className="form-group">
-          <label>Directories Updated</label>
-          <select
-            value={toSelectValue(signageData.directories_updated)}
-            onChange={(e) => setSignageData({ ...signageData, directories_updated: fromSelectValue(e.target.value) })}
-          >
-            <option value="na">N/A</option>
-            <option value="yes">Yes</option>
-            <option value="no">No</option>
-          </select>
-        </div>
-        <div className="form-group">
-          <label>Postbox Labels Updated</label>
-          <select
-            value={toSelectValue(signageData.postbox_labels_updated)}
-            onChange={(e) => setSignageData({ ...signageData, postbox_labels_updated: fromSelectValue(e.target.value) })}
-          >
-            <option value="na">N/A</option>
-            <option value="yes">Yes</option>
-            <option value="no">No</option>
-          </select>
-        </div>
-        <div className="form-group">
-          <label>Parking Labels Updated</label>
-          <select
-            value={toSelectValue(signageData.parking_labels_updated)}
-            onChange={(e) => setSignageData({ ...signageData, parking_labels_updated: fromSelectValue(e.target.value) })}
-          >
-            <option value="na">N/A</option>
-            <option value="yes">Yes</option>
-            <option value="no">No</option>
-          </select>
-        </div>
+      <div className="signage-list">
+        {renderSignageRow('Directories Updated', 'directories_updated')}
+        {renderSignageRow('Postbox Labels Updated', 'postbox_labels_updated')}
+        {renderSignageRow('Parking Labels Updated', 'parking_labels_updated')}
       </div>
       <div className="form-group">
         <label>Other Signage Requirements</label>
