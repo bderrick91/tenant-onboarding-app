@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { getAllOnboardings, createOnboarding, getProperties, addProperty } from '../utils/supabaseClient';
+import { calculateSectionStatus } from './OnboardingPage';
 import { Plus, Eye, Trash2, AlertCircle } from 'lucide-react';
 
 function DashboardPage({ onSelectOnboarding, user }) {
@@ -96,11 +97,35 @@ function DashboardPage({ onSelectOnboarding, user }) {
     }
   };
 
-  const getProgressPercentage = (onboarding) => {
-    const steps = onboarding.compliance_workflow_steps || [];
-    if (steps.length === 0) return 0;
-    const completed = steps.filter(s => s.is_complete).length;
-    return Math.round((completed / steps.length) * 100);
+  const getProgressInfo = (onboarding) => {
+    const handoverData = onboarding.handover_details?.[0] || onboarding.handover_details || {};
+    const complianceNA = onboarding.compliance_na || false;
+    const complianceDocs = onboarding.compliance_documents || [];
+    const meters = onboarding.meters || [];
+    const meterReadings = {};
+    meters.forEach(m => {
+      const r = (m.meter_readings && m.meter_readings[0]) || null;
+      if (r) meterReadings[m.id] = r;
+    });
+    const signageData = onboarding.signage?.[0] || onboarding.signage || {};
+    const contacts = onboarding.tenant_contacts || [];
+
+    const sections = calculateSectionStatus({
+      handoverData,
+      complianceNA,
+      complianceDocs,
+      meters,
+      meterReadings,
+      signageData,
+      contacts
+    });
+
+    const applicable = sections.filter(s => !s.na);
+    const percentage = applicable.length > 0
+      ? Math.round((applicable.filter(s => s.complete).length / applicable.length) * 100)
+      : 100;
+
+    return { percentage, sections };
   };
 
   const getStatusColor = (status) => {
@@ -229,7 +254,7 @@ function DashboardPage({ onSelectOnboarding, user }) {
         ) : (
           <div className="cards-grid">
             {onboardings.map(onboarding => {
-              const progress = getProgressPercentage(onboarding);
+              const { percentage, sections } = getProgressInfo(onboarding);
               const statusClass = getStatusColor(onboarding.status);
 
               return (
@@ -247,8 +272,16 @@ function DashboardPage({ onSelectOnboarding, user }) {
                     <p><strong>Start Date:</strong> {onboarding.start_date}</p>
 
                     <div className="progress-bar">
-                      <div className="progress-fill" style={{ width: `${progress}%` }}></div>
-                      <span className="progress-text">{progress}% complete</span>
+                      <div className="progress-fill" style={{ width: `${percentage}%` }}></div>
+                      <span className="progress-text">{percentage}% complete</span>
+                    </div>
+
+                    <div className="progress-breakdown">
+                      {sections.map(s => (
+                        <span key={s.key} className={`progress-chip ${s.na ? 'chip-na' : s.complete ? 'chip-done' : 'chip-pending'}`}>
+                          {s.label}{s.na ? ' (N/A)' : s.complete ? ' ✓' : ''}
+                        </span>
+                      ))}
                     </div>
                   </div>
 
