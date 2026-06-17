@@ -68,7 +68,8 @@ export const getAllOnboardings = async () => {
       properties(name),
       handover_details(*),
       compliance_documents(*),
-      meters(*),
+      meters(*, meter_readings(*)),
+      signage(*),
       compliance_workflow_steps(*),
       custom_workflow_steps(*),
       tenant_contacts(*)
