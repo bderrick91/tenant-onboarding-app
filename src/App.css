@@ -255,6 +255,47 @@ body {
   cursor: pointer;
 }
 
+/* Signage checklist rows */
+.signage-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+  margin-bottom: var(--spacing-md);
+}
+
+.signage-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--spacing-sm) var(--spacing-md);
+  border: 1px solid var(--border-color, #e2e8f0);
+  border-radius: 6px;
+}
+
+.signage-row-main {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  font-weight: normal;
+  cursor: pointer;
+}
+
+.signage-row-na {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.85rem;
+  color: var(--text-secondary, #64748b);
+  cursor: pointer;
+}
+
+.signage-row-main input[type="checkbox"],
+.signage-row-na input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+}
+
 /* Cards */
 .card {
   background: white;
@@ -345,6 +386,36 @@ body {
 
 .progress-section {
   margin-bottom: var(--spacing-lg);
+}
+
+.progress-breakdown {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.progress-chip {
+  font-size: 0.75rem;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-weight: 500;
+}
+
+.chip-done {
+  background-color: #dcfce7;
+  color: #166534;
+}
+
+.chip-pending {
+  background-color: #f1f5f9;
+  color: #475569;
+}
+
+.chip-na {
+  background-color: #e2e8f0;
+  color: #64748b;
+  font-style: italic;
 }
 
 /* Messages */
