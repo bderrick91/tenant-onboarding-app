@@ -1,0 +1,935 @@
+import React, { useState, useEffect } from 'react';
+import {
+  updateOnboarding,
+  updateHandover,
+  addComplianceDocument,
+  deleteComplianceDocument,
+  addMeter,
+  deleteMeter,
+  addMeterReading,
+  getMeterReading,
+  updateSignage,
+  updateWorkflowStep,
+  addCustomStep,
+  deleteCustomStep,
+  addTenantContact,
+  deleteTenantContact,
+  uploadFile,
+  deleteFile
+} from '../utils/supabaseClient';
+import { extractMeterReading } from '../utils/ocrService';
+import { sendComplianceDocumentsEmail, sendUtilitiesInfoEmail, sendContactInfoRequestEmail } from '../utils/emailService';
+import { generateSimpleOnboardingPDF } from '../utils/pdfService';
+import { ChevronLeft, Plus, Trash2, Send, Download, AlertCircle, CheckCircle, Clock } from 'lucide-react';
+
+// Shared progress logic — also used by DashboardPage for the record list view.
+// Returns an array of { key, label, na, complete } for the 5 trackable sections.
+export function calculateSectionStatus({ handoverData, complianceNA, complianceDocs, meters, meterReadings, signageData, contacts }) {
+  const handoverComplete = !!(handoverData && handoverData.handover_date);
+
+  const complianceComplete = complianceNA || (complianceDocs && complianceDocs.length > 0);
+
+  const meterList = meters || [];
+  const readingsMap = meterReadings || {};
+  const utilitiesComplete = meterList.length > 0 && meterList.every(m => !!readingsMap[m.id]);
+
+  const signageFields = ['directories_updated', 'postbox_labels_updated', 'parking_labels_updated'];
+  const signageAllResolved = signageData
+    ? signageFields.every(f => signageData[f] === true || signageData[f] === null || signageData[f] === undefined)
+    : false;
+
+  const contactsComplete = (contacts || []).some(c => c.contact_type === 'principal');
+
+  return [
+    { key: 'handover', label: 'Handover', na: false, complete: handoverComplete },
+    { key: 'compliance', label: 'Compliance', na: complianceNA, complete: complianceComplete },
+    { key: 'utilities', label: 'Utilities', na: false, complete: utilitiesComplete },
+    { key: 'signage', label: 'Signage', na: false, complete: signageAllResolved },
+    { key: 'contacts', label: 'Contacts', na: false, complete: contactsComplete }
+  ];
+}
+
+function OnboardingPage({ onboarding: initialOnboarding, onBack, user }) {
+  const [onboarding, setOnboarding] = useState(initialOnboarding);
+  const [activeTab, setActiveTab] = useState('handover');
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState({ type: '', text: '' });
+
+  // Handover state
+  const [handoverData, setHandoverData] = useState(
+    onboarding.handover_details ? { ...onboarding.handover_details } : {
+      handover_date: '',
+      keys_handed: '',
+      codes_handed: '',
+      access_restricted_to_tenant_only: false,
+      gate_access_granted: false
+    }
+  );
+
+  // Compliance documents state
+  const [docType, setDocType] = useState('EICR');
+  const [docDate, setDocDate] = useState('');
+  const [docNotes, setDocNotes] = useState('');
+  const [docFile, setDocFile] = useState(null);
+  const [complianceDocs, setComplianceDocs] = useState(onboarding.compliance_documents || []);
+  const [complianceNA, setComplianceNA] = useState(onboarding.compliance_na || false);
+
+  // Meters state
+  const [meters, setMeters] = useState(onboarding.meters || []);
+  const [newMeter, setNewMeter] = useState({
+    meter_type: 'electricity',
+    supply_ref: '',
+    meter_serial_nr: '',
+    day_night_flag: false
+  });
+  const [meterReadings, setMeterReadings] = useState({});
+
+  // Signage state
+  const [signageData, setSignageData] = useState(
+    onboarding.signage ? { ...onboarding.signage } : {
+      directories_updated: null,
+      postbox_labels_updated: null,
+      parking_labels_updated: null,
+      other_signage: '',
+      notes: ''
+    }
+  );
+
+  // Workflow state
+  const [workflowSteps, setWorkflowSteps] = useState(onboarding.compliance_workflow_steps || []);
+  const [customSteps, setCustomSteps] = useState(onboarding.custom_workflow_steps || []);
+  const [newCustomStep, setNewCustomStep] = useState('');
+
+  // Contacts state
+  const [contacts, setContacts] = useState(onboarding.tenant_contacts || []);
+  const [newContact, setNewContact] = useState({
+    contact_type: 'principal',
+    name: '',
+    tel: '',
+    email: ''
+  });
+
+  // Load meter readings on mount
+  useEffect(() => {
+    loadMeterReadings();
+  }, [meters]);
+
+  const loadMeterReadings = async () => {
+    const readings = {};
+    for (const meter of meters) {
+      const { data } = await getMeterReading(meter.id);
+      if (data) readings[meter.id] = data;
+    }
+    setMeterReadings(readings);
+  };
+
+  const showMessage = (type, text) => {
+    setMessage({ type, text });
+    setTimeout(() => setMessage({ type: '', text: '' }), 3000);
+  };
+
+  // Handover handlers
+  const handleSaveHandover = async () => {
+    setSaving(true);
+    const { error } = await updateHandover(onboarding.id, handoverData);
+    setSaving(false);
+    if (error) {
+      showMessage('error', 'Failed to save handover details');
+    } else {
+      showMessage('success', 'Handover details saved');
+    }
+  };
+
+  // Compliance document handlers
+  const handleAddCompliance = async () => {
+    if (!docDate || !docType) {
+      showMessage('error', 'Date and document type required');
+      return;
+    }
+
+    setSaving(true);
+    let filePath = null;
+
+    if (docFile) {
+      const filename = `${onboarding.id}/${Date.now()}_${docFile.name}`;
+      const { error: uploadError } = await uploadFile(docFile, 'onboarding-files', filename);
+      if (uploadError) {
+        showMessage('error', 'File upload failed');
+        setSaving(false);
+        return;
+      }
+      filePath = filename;
+    }
+
+    const { error } = await addComplianceDocument(
+      onboarding.id,
+      docType,
+      docDate,
+      docNotes,
+      filePath || ''
+    );
+
+    setSaving(false);
+    if (error) {
+      showMessage('error', 'Failed to add document');
+    } else {
+      showMessage('success', 'Document added');
+      setDocType('EICR');
+      setDocDate('');
+      setDocNotes('');
+      setDocFile(null);
+      // Reload
+      const updatedOnboarding = { ...onboarding, compliance_documents: [...(onboarding.compliance_documents || []), { doc_type: docType, document_date: docDate, notes: docNotes }] };
+      setOnboarding(updatedOnboarding);
+    }
+  };
+
+  const handleDeleteCompliance = async (id) => {
+    setSaving(true);
+    const doc = complianceDocs.find(d => d.id === id);
+    if (doc?.file_path) {
+      await deleteFile('onboarding-files', doc.file_path);
+    }
+    const { error } = await deleteComplianceDocument(id);
+    setSaving(false);
+    if (!error) {
+      setComplianceDocs(complianceDocs.filter(d => d.id !== id));
+      showMessage('success', 'Document deleted');
+    }
+  };
+
+  // Meter handlers
+  const handleAddMeter = async () => {
+    if (!newMeter.supply_ref && !newMeter.meter_serial_nr) {
+      showMessage('error', 'Supply Reference or Meter Serial Number required');
+      return;
+    }
+
+    setSaving(true);
+    const { data, error } = await addMeter(
+      onboarding.id,
+      newMeter.meter_type,
+      newMeter.meter_serial_nr || newMeter.supply_ref,
+      newMeter.supply_ref,
+      newMeter.meter_serial_nr,
+      newMeter.day_night_flag
+    );
+    setSaving(false);
+
+    if (error) {
+      showMessage('error', 'Failed to add meter');
+    } else {
+      setMeters([...meters, data[0]]);
+      setNewMeter({
+        meter_type: 'electricity',
+        supply_ref: '',
+        meter_serial_nr: '',
+        day_night_flag: false
+      });
+      showMessage('success', 'Meter added');
+    }
+  };
+
+  const handleDeleteMeter = async (id) => {
+    setSaving(true);
+    const { error } = await deleteMeter(id);
+    setSaving(false);
+    if (!error) {
+      setMeters(meters.filter(m => m.id !== id));
+      showMessage('success', 'Meter deleted');
+    }
+  };
+
+  // Meter reading handlers
+  const handleMeterPhotoUpload = async (meterId, file) => {
+    showMessage('info', 'Extracting reading from image...');
+
+    const result = await extractMeterReading(file);
+
+    if (result.success) {
+      // Found reading via OCR
+      const newReading = result.reading;
+      const today = new Date().toISOString().split('T')[0];
+
+      // Upload photo
+      const filename = `${onboarding.id}/${meterId}/${Date.now()}_meter.jpg`;
+      await uploadFile(file, 'onboarding-files', filename);
+
+      // Save reading (OCR fills total only; day/night entered manually if applicable)
+      const { error } = await addMeterReading(meterId, today, newReading, filename, true, null, null);
+      if (!error) {
+        setMeterReadings({
+          ...meterReadings,
+          [meterId]: { meter_id: meterId, reading_date: today, reading_value: newReading, extracted_by_ocr: true }
+        });
+        showMessage('success', `Reading extracted: ${newReading}`);
+      }
+    } else {
+      showMessage('error', result.error);
+    }
+  };
+
+  const handleSaveReading = async (meterId, readingValue, readingDay, readingNight) => {
+    if (!readingValue) {
+      showMessage('error', 'Enter a reading value');
+      return;
+    }
+
+    const today = new Date().toISOString().split('T')[0];
+    setSaving(true);
+    const { error } = await addMeterReading(
+      meterId,
+      today,
+      parseFloat(readingValue),
+      null,
+      false,
+      readingDay !== undefined && readingDay !== '' ? parseFloat(readingDay) : null,
+      readingNight !== undefined && readingNight !== '' ? parseFloat(readingNight) : null
+    );
+    setSaving(false);
+
+    if (!error) {
+      setMeterReadings({
+        ...meterReadings,
+        [meterId]: { meter_id: meterId, reading_date: today, reading_value: parseFloat(readingValue), reading_day: readingDay, reading_night: readingNight }
+      });
+      showMessage('success', 'Reading saved');
+    }
+  };
+
+  // Workflow handlers
+  const handleToggleWorkflow = async (stepId) => {
+    const step = workflowSteps.find(s => s.id === stepId);
+    setSaving(true);
+    const { error } = await updateWorkflowStep(stepId, !step.is_complete);
+    setSaving(false);
+
+    if (!error) {
+      setWorkflowSteps(workflowSteps.map(s =>
+        s.id === stepId ? { ...s, is_complete: !s.is_complete } : s
+      ));
+    }
+  };
+
+  const handleAddCustomStep = async () => {
+    if (!newCustomStep.trim()) return;
+    setSaving(true);
+    const { data, error } = await addCustomStep(onboarding.id, newCustomStep);
+    setSaving(false);
+
+    if (!error) {
+      setCustomSteps([...customSteps, data[0]]);
+      setNewCustomStep('');
+      showMessage('success', 'Step added');
+    }
+  };
+
+  const handleDeleteCustomStep = async (id) => {
+    setSaving(true);
+    const { error } = await deleteCustomStep(id);
+    setSaving(false);
+
+    if (!error) {
+      setCustomSteps(customSteps.filter(s => s.id !== id));
+      showMessage('success', 'Step deleted');
+    }
+  };
+
+  // Contact handlers
+  const handleAddContact = async () => {
+    if (!newContact.name) {
+      showMessage('error', 'Name required');
+      return;
+    }
+
+    setSaving(true);
+    const { data, error } = await addTenantContact(
+      onboarding.id,
+      newContact.contact_type,
+      newContact.name,
+      newContact.tel,
+      newContact.email
+    );
+    setSaving(false);
+
+    if (!error) {
+      setContacts([...contacts, data[0]]);
+      setNewContact({ contact_type: 'principal', name: '', tel: '', email: '' });
+      showMessage('success', 'Contact added');
+    }
+  };
+
+  const handleDeleteContact = async (id) => {
+    setSaving(true);
+    const { error } = await deleteTenantContact(id);
+    setSaving(false);
+
+    if (!error) {
+      setContacts(contacts.filter(c => c.id !== id));
+      showMessage('success', 'Contact deleted');
+    }
+  };
+
+  // Email handlers
+  const handleEmailCompliance = async () => {
+    const principalContact = contacts.find(c => c.contact_type === 'principal');
+    if (!principalContact?.email) {
+      showMessage('error', 'No principal contact email found');
+      return;
+    }
+
+    setSaving(true);
+    const { success, error } = await sendComplianceDocumentsEmail(
+      principalContact.email,
+      principalContact.name,
+      onboarding.properties?.name,
+      onboarding.unit_reference,
+      complianceDocs
+    );
+    setSaving(false);
+
+    if (success) {
+      showMessage('success', `Email sent to ${principalContact.email}`);
+    } else {
+      showMessage('error', `Email failed: ${error}`);
+    }
+  };
+
+  const handleEmailUtilities = async () => {
+    const principalContact = contacts.find(c => c.contact_type === 'principal');
+    if (!principalContact?.email) {
+      showMessage('error', 'No principal contact email found');
+      return;
+    }
+
+    setSaving(true);
+    const metersWithReadings = meters.map(m => ({
+      ...m,
+      reading: meterReadings[m.id]
+    }));
+
+    const { success, error } = await sendUtilitiesInfoEmail(
+      principalContact.email,
+      principalContact.name,
+      onboarding.properties?.name,
+      onboarding.unit_reference,
+      metersWithReadings
+    );
+    setSaving(false);
+
+    if (success) {
+      showMessage('success', `Email sent to ${principalContact.email}`);
+    } else {
+      showMessage('error', `Email failed: ${error}`);
+    }
+  };
+
+  const handleEmailContacts = async () => {
+    const principalContact = contacts.find(c => c.contact_type === 'principal');
+    if (!principalContact?.email) {
+      showMessage('error', 'No principal contact email found');
+      return;
+    }
+
+    setSaving(true);
+    const { success, error } = await sendContactInfoRequestEmail(
+      principalContact.email,
+      principalContact.name,
+      onboarding.properties?.name
+    );
+    setSaving(false);
+
+    if (success) {
+      showMessage('success', `Contact form sent to ${principalContact.email}`);
+    } else {
+      showMessage('error', `Email failed: ${error}`);
+    }
+  };
+
+  // Compliance N/A toggle
+  const handleToggleComplianceNA = async (checked) => {
+    setComplianceNA(checked);
+    setSaving(true);
+    const { error } = await updateOnboarding(onboarding.id, { compliance_na: checked });
+    setSaving(false);
+    if (error) {
+      showMessage('error', 'Failed to update compliance status');
+    } else {
+      showMessage('success', checked ? 'Compliance marked N/A' : 'Compliance re-enabled');
+    }
+  };
+
+  // PDF export
+  const handleExportPDF = () => {
+    const result = generateSimpleOnboardingPDF(onboarding);
+    if (result.success) {
+      showMessage('success', 'PDF exported');
+    } else {
+      showMessage('error', `PDF export failed: ${result.error}`);
+    }
+  };
+
+  // Real cross-tab progress: 5 sections, each either N/A or scored complete/incomplete
+  const sectionStatus = calculateSectionStatus({
+    handoverData,
+    complianceNA,
+    complianceDocs,
+    meters,
+    meterReadings,
+    signageData,
+    contacts
+  });
+  const applicableSections = sectionStatus.filter(s => !s.na);
+  const progressPercentage = applicableSections.length > 0
+    ? Math.round((applicableSections.filter(s => s.complete).length / applicableSections.length) * 100)
+    : 100;
+
+  return (
+    <div className="onboarding-page">
+      <div className="onboarding-header">
+        <button className="btn btn-secondary" onClick={onBack}>
+          <ChevronLeft size={20} /> Back
+        </button>
+        <div className="header-content">
+          <h2>{onboarding.unit_reference}</h2>
+          <p>{onboarding.properties?.name} • {onboarding.tenant_names}</p>
+        </div>
+        <button className="btn btn-secondary" onClick={handleExportPDF}>
+          <Download size={20} /> Export PDF
+        </button>
+      </div>
+
+      <div className="progress-section">
+        <div className="progress-bar">
+          <div className="progress-fill" style={{ width: `${progressPercentage}%` }}></div>
+        </div>
+        <p className="progress-text">{progressPercentage}% Complete</p>
+        <div className="progress-breakdown">
+          {sectionStatus.map(s => (
+            <span key={s.key} className={`progress-chip ${s.na ? 'chip-na' : s.complete ? 'chip-done' : 'chip-pending'}`}>
+              {s.label}{s.na ? ' (N/A)' : s.complete ? ' ✓' : ''}
+            </span>
+          ))}
+        </div>
+      </div>
+
+      {message.text && (
+        <div className={`message message-${message.type}`}>
+          {message.type === 'success' && <CheckCircle size={16} />}
+          {message.type === 'error' && <AlertCircle size={16} />}
+          {message.type === 'info' && <Clock size={16} />}
+          {message.text}
+        </div>
+      )}
+
+      <div className="tabs">
+        <button
+          className={`tab ${activeTab === 'handover' ? 'active' : ''}`}
+          onClick={() => setActiveTab('handover')}
+        >
+          Handover
+        </button>
+        <button
+          className={`tab ${activeTab === 'compliance' ? 'active' : ''}`}
+          onClick={() => setActiveTab('compliance')}
+        >
+          Compliance
+        </button>
+        <button
+          className={`tab ${activeTab === 'utilities' ? 'active' : ''}`}
+          onClick={() => setActiveTab('utilities')}
+        >
+          Utilities
+        </button>
+        <button
+          className={`tab ${activeTab === 'signage' ? 'active' : ''}`}
+          onClick={() => setActiveTab('signage')}
+        >
+          Signage
+        </button>
+        <button
+          className={`tab ${activeTab === 'workflow' ? 'active' : ''}`}
+          onClick={() => setActiveTab('workflow')}
+        >
+          Workflow
+        </button>
+        <button
+          className={`tab ${activeTab === 'contacts' ? 'active' : ''}`}
+          onClick={() => setActiveTab('contacts')}
+        >
+          Contacts
+        </button>
+      </div>
+
+      <div className="tab-content">
+        {activeTab === 'handover' && <HandoverSection handoverData={handoverData} setHandoverData={setHandoverData} onSave={handleSaveHandover} saving={saving} />}
+        {activeTab === 'compliance' && <ComplianceSection complianceDocs={complianceDocs} docType={docType} setDocType={setDocType} docDate={docDate} setDocDate={setDocDate} docNotes={docNotes} setDocNotes={setDocNotes} docFile={docFile} setDocFile={setDocFile} onAdd={handleAddCompliance} onDelete={handleDeleteCompliance} saving={saving} complianceNA={complianceNA} onToggleNA={handleToggleComplianceNA} />}
+        {activeTab === 'utilities' && <UtilitiesSection meters={meters} newMeter={newMeter} setNewMeter={setNewMeter} onAddMeter={handleAddMeter} onDeleteMeter={handleDeleteMeter} meterReadings={meterReadings} onPhotoUpload={handleMeterPhotoUpload} onSaveReading={handleSaveReading} onEmailUtilities={handleEmailUtilities} saving={saving} />}
+        {activeTab === 'signage' && <SignageSection signageData={signageData} setSignageData={setSignageData} onSave={async () => { setSaving(true); await updateSignage(onboarding.id, signageData); setSaving(false); showMessage('success', 'Signage saved'); }} saving={saving} />}
+        {activeTab === 'workflow' && <WorkflowSection workflowSteps={workflowSteps} customSteps={customSteps} newCustomStep={newCustomStep} setNewCustomStep={setNewCustomStep} onToggleWorkflow={handleToggleWorkflow} onAddCustomStep={handleAddCustomStep} onDeleteCustomStep={handleDeleteCustomStep} saving={saving} />}
+        {activeTab === 'contacts' && <ContactsSection contacts={contacts} newContact={newContact} setNewContact={setNewContact} onAdd={handleAddContact} onDelete={handleDeleteContact} onEmailCompliance={handleEmailCompliance} onEmailContacts={handleEmailContacts} saving={saving} />}
+      </div>
+    </div>
+  );
+}
+
+// Sub-components for each section
+function HandoverSection({ handoverData, setHandoverData, onSave, saving }) {
+  return (
+    <div className="section">
+      <h3>Tenant Handover</h3>
+      <div className="form-row">
+        <div className="form-group">
+          <label>Handover Date</label>
+          <input type="date" value={handoverData.handover_date || ''} onChange={(e) => setHandoverData({ ...handoverData, handover_date: e.target.value })} />
+        </div>
+        <div className="form-group">
+          <label>Keys Handed Over</label>
+          <input type="text" placeholder="e.g., 2 sets handed over, 1 retained" value={handoverData.keys_handed || ''} onChange={(e) => setHandoverData({ ...handoverData, keys_handed: e.target.value })} />
+        </div>
+      </div>
+      <div className="form-row">
+        <div className="form-group">
+          <label>Codes Handed Over</label>
+          <input type="text" placeholder="e.g., Gate code: 1234" value={handoverData.codes_handed || ''} onChange={(e) => setHandoverData({ ...handoverData, codes_handed: e.target.value })} />
+        </div>
+      </div>
+      <div className="checkbox-group">
+        <label>
+          <input type="checkbox" checked={handoverData.access_restricted_to_tenant_only || false} onChange={(e) => setHandoverData({ ...handoverData, access_restricted_to_tenant_only: e.target.checked })} />
+          Access Control: Restricted to Tenant Only
+        </label>
+        <label>
+          <input type="checkbox" checked={handoverData.gate_access_granted || false} onChange={(e) => setHandoverData({ ...handoverData, gate_access_granted: e.target.checked })} />
+          Gate Access Granted
+        </label>
+      </div>
+      <button className="btn btn-primary" onClick={onSave} disabled={saving}>Save Handover</button>
+    </div>
+  );
+}
+
+function ComplianceSection({ complianceDocs, docType, setDocType, docDate, setDocDate, docNotes, setDocNotes, docFile, setDocFile, onAdd, onDelete, saving, complianceNA, onToggleNA }) {
+  return (
+    <div className="section">
+      <h3>Compliance Documents</h3>
+      <div className="checkbox-group" style={{ marginBottom: 'var(--spacing-md)' }}>
+        <label>
+          <input type="checkbox" checked={complianceNA} onChange={(e) => onToggleNA(e.target.checked)} />
+          Not Applicable for this Onboarding
+        </label>
+      </div>
+
+      {!complianceNA && (
+        <>
+          <div className="form-row">
+            <div className="form-group">
+              <label>Document Type</label>
+              <input type="text" placeholder="e.g., EICR, Gas Certificate, Air-Con Service" value={docType} onChange={(e) => setDocType(e.target.value)} />
+            </div>
+            <div className="form-group">
+              <label>Date</label>
+              <input type="date" value={docDate} onChange={(e) => setDocDate(e.target.value)} />
+            </div>
+          </div>
+          <div className="form-group">
+            <label>Notes</label>
+            <textarea placeholder="Optional notes" value={docNotes} onChange={(e) => setDocNotes(e.target.value)} rows="2"></textarea>
+          </div>
+          <div className="form-group">
+            <label>Upload Document (optional)</label>
+            <input type="file" onChange={(e) => setDocFile(e.target.files?.[0])} />
+          </div>
+          <button className="btn btn-primary" onClick={onAdd} disabled={saving}><Plus size={16} /> Add Document</button>
+
+          {complianceDocs.length > 0 && (
+            <div className="documents-list">
+              {complianceDocs.map(doc => (
+                <div key={doc.id} className="doc-item">
+                  <span>{doc.doc_type} ({doc.document_date})</span>
+                  <button className="btn btn-danger btn-sm" onClick={() => onDelete(doc.id)} disabled={saving}><Trash2 size={14} /></button>
+                </div>
+              ))}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function UtilitiesSection({ meters, newMeter, setNewMeter, onAddMeter, onDeleteMeter, meterReadings, onPhotoUpload, onSaveReading, onEmailUtilities, saving }) {
+  const [readingInputs, setReadingInputs] = useState({});
+
+  const updateReadingInput = (meterId, field, value) => {
+    const current = readingInputs[meterId] || {};
+    const updated = { ...current, [field]: value };
+
+    // Auto-calculate total when day or night changes, unless user has manually edited total
+    if ((field === 'day' || field === 'night') && !updated.totalManuallyEdited) {
+      const day = parseFloat(updated.day) || 0;
+      const night = parseFloat(updated.night) || 0;
+      updated.total = (day || night) ? (day + night).toString() : '';
+    }
+
+    if (field === 'total') {
+      updated.totalManuallyEdited = true;
+    }
+
+    setReadingInputs({ ...readingInputs, [meterId]: updated });
+  };
+
+  const unitFor = (meterType) => meterType === 'electricity' ? 'kWh' : 'm³';
+
+  return (
+    <div className="section">
+      <h3>Utilities & Meters</h3>
+      <div className="form-row">
+        <div className="form-group">
+          <label>Meter Type</label>
+          <select value={newMeter.meter_type} onChange={(e) => setNewMeter({ ...newMeter, meter_type: e.target.value })}>
+            <option value="electricity">Electricity</option>
+            <option value="gas">Gas</option>
+            <option value="water">Water</option>
+          </select>
+        </div>
+        <div className="form-group">
+          <label>Supply Reference</label>
+          <input type="text" value={newMeter.supply_ref} onChange={(e) => setNewMeter({ ...newMeter, supply_ref: e.target.value })} />
+        </div>
+      </div>
+      <div className="form-row">
+        <div className="form-group">
+          <label>Meter Serial Number</label>
+          <input type="text" value={newMeter.meter_serial_nr} onChange={(e) => setNewMeter({ ...newMeter, meter_serial_nr: e.target.value })} />
+        </div>
+      </div>
+      {newMeter.meter_type === 'electricity' && (
+        <label>
+          <input type="checkbox" checked={newMeter.day_night_flag} onChange={(e) => setNewMeter({ ...newMeter, day_night_flag: e.target.checked })} />
+          Day/Night Tariff
+        </label>
+      )}
+      <button className="btn btn-primary" onClick={onAddMeter} disabled={saving}><Plus size={16} /> Add Meter</button>
+
+      {meters.length > 0 && (
+        <div className="meters-list">
+          {meters.map(meter => {
+            const reading = meterReadings[meter.id];
+            const inputs = readingInputs[meter.id] || {};
+            const isElectricity = meter.meter_type === 'electricity';
+            const showDayNight = isElectricity && meter.day_night_flag;
+            const unit = unitFor(meter.meter_type);
+
+            return (
+              <div key={meter.id} className="meter-item card">
+                <div className="meter-header">
+                  <h4>{meter.meter_type.toUpperCase()} {meter.meter_serial_nr ? `- ${meter.meter_serial_nr}` : ''}</h4>
+                  <button className="btn btn-danger btn-sm" onClick={() => onDeleteMeter(meter.id)} disabled={saving}><Trash2 size={14} /></button>
+                </div>
+                <p><small>{meter.supply_ref && `Supply Ref: ${meter.supply_ref}`}</small></p>
+
+                <div className="reading-section">
+                  <div className="form-group">
+                    <label>Photo Upload (OCR)</label>
+                    <input type="file" accept="image/*" onChange={(e) => onPhotoUpload(meter.id, e.target.files?.[0])} />
+                  </div>
+
+                  {showDayNight && (
+                    <div className="form-row">
+                      <div className="form-group">
+                        <label>Day Reading (kWh)</label>
+                        <input
+                          type="number"
+                          step="0.01"
+                          value={inputs.day ?? ''}
+                          onChange={(e) => updateReadingInput(meter.id, 'day', e.target.value)}
+                          placeholder="Day reading"
+                        />
+                      </div>
+                      <div className="form-group">
+                        <label>Night Reading (kWh)</label>
+                        <input
+                          type="number"
+                          step="0.01"
+                          value={inputs.night ?? ''}
+                          onChange={(e) => updateReadingInput(meter.id, 'night', e.target.value)}
+                          placeholder="Night reading"
+                        />
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="form-group">
+                    <label>Total Reading ({unit}) {reading ? `— last saved ${reading.reading_date}` : ''}</label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={inputs.total ?? reading?.reading_value ?? ''}
+                      onChange={(e) => updateReadingInput(meter.id, 'total', e.target.value)}
+                      placeholder={showDayNight ? 'Auto-calculated from day + night, editable' : `Enter reading in ${unit}`}
+                    />
+                  </div>
+                  <button className="btn btn-primary btn-sm" onClick={() => onSaveReading(meter.id, inputs.total || '', inputs.day, inputs.night)} disabled={saving}>Save Reading</button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      <button className="btn btn-primary" onClick={onEmailUtilities} disabled={saving}><Send size={16} /> Email Utilities Info</button>
+    </div>
+  );
+}
+
+function SignageSection({ signageData, setSignageData, onSave, saving }) {
+  // Three-state per item: null = N/A, true = Done, false = Not done yet
+  const renderSignageRow = (label, field) => {
+    const value = signageData[field];
+    const isNA = value === null || value === undefined;
+
+    return (
+      <div className="signage-row" key={field}>
+        <label className="signage-row-main">
+          <input
+            type="checkbox"
+            checked={value === true}
+            disabled={isNA}
+            onChange={(e) => setSignageData({ ...signageData, [field]: e.target.checked })}
+          />
+          {label}
+        </label>
+        <label className="signage-row-na">
+          <input
+            type="checkbox"
+            checked={isNA}
+            onChange={(e) => setSignageData({ ...signageData, [field]: e.target.checked ? null : false })}
+          />
+          N/A
+        </label>
+      </div>
+    );
+  };
+
+  return (
+    <div className="section">
+      <h3>Signage Updated</h3>
+      <div className="signage-list">
+        {renderSignageRow('Directories Updated', 'directories_updated')}
+        {renderSignageRow('Postbox Labels Updated', 'postbox_labels_updated')}
+        {renderSignageRow('Parking Labels Updated', 'parking_labels_updated')}
+      </div>
+      <div className="form-group">
+        <label>Other Signage Requirements</label>
+        <textarea placeholder="e.g., Door numbering, directional signs" value={signageData.other_signage || ''} onChange={(e) => setSignageData({ ...signageData, other_signage: e.target.value })} rows="2"></textarea>
+      </div>
+      <div className="form-group">
+        <label>Notes</label>
+        <textarea value={signageData.notes || ''} onChange={(e) => setSignageData({ ...signageData, notes: e.target.value })} rows="2"></textarea>
+      </div>
+      <button className="btn btn-primary" onClick={onSave} disabled={saving}>Save Signage</button>
+    </div>
+  );
+}
+
+function WorkflowSection({ workflowSteps, customSteps, newCustomStep, setNewCustomStep, onToggleWorkflow, onAddCustomStep, onDeleteCustomStep, saving }) {
+  return (
+    <div className="section">
+      <h3>Workflow Checklist</h3>
+
+      {workflowSteps.length > 0 && (
+        <div className="checklist">
+          {workflowSteps.map(step => (
+            <label key={step.id} className="checklist-item">
+              <input type="checkbox" checked={step.is_complete} onChange={() => onToggleWorkflow(step.id)} disabled={saving} />
+              <span>{step.step_name}</span>
+              {step.is_complete && <CheckCircle size={16} className="check-icon" />}
+            </label>
+          ))}
+        </div>
+      )}
+
+      <div className="custom-steps">
+        <h4>Custom Steps</h4>
+        {customSteps.length > 0 && (
+          <div className="checklist">
+            {customSteps.map(step => (
+              <div key={step.id} className="custom-step-item">
+                <label>
+                  <input type="checkbox" checked={step.is_complete} onChange={() => onToggleWorkflow(step.id)} disabled={saving} />
+                  <span>{step.step_name}</span>
+                </label>
+                <button className="btn btn-danger btn-sm" onClick={() => onDeleteCustomStep(step.id)} disabled={saving}><Trash2 size={14} /></button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div className="form-group">
+          <input type="text" placeholder="Add custom step" value={newCustomStep} onChange={(e) => setNewCustomStep(e.target.value)} />
+          <button className="btn btn-primary btn-sm" onClick={onAddCustomStep} disabled={saving}><Plus size={16} /> Add</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ContactsSection({ contacts, newContact, setNewContact, onAdd, onDelete, onEmailCompliance, onEmailContacts, saving }) {
+  return (
+    <div className="section">
+      <h3>Tenant Contacts</h3>
+
+      <div className="form-row">
+        <div className="form-group">
+          <label>Contact Type</label>
+          <select value={newContact.contact_type} onChange={(e) => setNewContact({ ...newContact, contact_type: e.target.value })}>
+            <option value="principal">Principal</option>
+            <option value="accounts">Accounts</option>
+            <option value="facilities">Facilities</option>
+            <option value="out-of-hours">Out of Hours</option>
+          </select>
+        </div>
+        <div className="form-group">
+          <label>Name *</label>
+          <input type="text" value={newContact.name} onChange={(e) => setNewContact({ ...newContact, name: e.target.value })} />
+        </div>
+      </div>
+
+      <div className="form-row">
+        <div className="form-group">
+          <label>Phone</label>
+          <input type="tel" value={newContact.tel} onChange={(e) => setNewContact({ ...newContact, tel: e.target.value })} />
+        </div>
+        <div className="form-group">
+          <label>Email</label>
+          <input type="email" value={newContact.email} onChange={(e) => setNewContact({ ...newContact, email: e.target.value })} />
+        </div>
+      </div>
+
+      <button className="btn btn-primary" onClick={onAdd} disabled={saving}><Plus size={16} /> Add Contact</button>
+
+      {contacts.length > 0 && (
+        <div className="contacts-list">
+          {contacts.map(contact => (
+            <div key={contact.id} className="contact-item">
+              <div>
+                <strong>{contact.name}</strong> ({contact.contact_type})
+                {contact.tel && <p>{contact.tel}</p>}
+                {contact.email && <p>{contact.email}</p>}
+              </div>
+              <button className="btn btn-danger btn-sm" onClick={() => onDelete(contact.id)} disabled={saving}><Trash2 size={14} /></button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="email-buttons">
+        <button className="btn btn-primary" onClick={onEmailCompliance} disabled={saving}><Send size={16} /> Email Compliance Docs</button>
+        <button className="btn btn-primary" onClick={onEmailContacts} disabled={saving}><Send size={16} /> Request Contact Info</button>
+      </div>
+    </div>
+  );
+}
+
+export default OnboardingPage;
